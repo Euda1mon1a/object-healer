@@ -101,10 +101,12 @@ from the object raises the threshold until it deletes the object too.
 - Blender files (`.blend`) are refused, because they can carry embedded Python. Blender runs
   with factory settings and with auto-run of embedded scripts off.
 - A glTF or GLB may refer to other files only through base64 `data:` URIs or relative paths
-  that stay inside its own folder, with symlinks followed. Absolute paths, `..` escapes and
-  `file:` or web URLs are refused. Blender then gets a private copy of the model and of those
-  files only. Each file is checked where it actually opened, so one swapped for a link to
-  somewhere else while it is being read is refused rather than copied.
+  inside its own folder. Absolute paths, `..` escapes, `file:` or web URLs and symlinks (even
+  ones that stay in the folder) are refused. Blender then gets a private copy of the model and
+  of those files only.
+- The model's folder is opened once, and the model and every file it refers to are opened from
+  that open folder without following a symlink. Renaming or swapping folders while it runs
+  can't redirect a read to somewhere else.
 - Files a glTF or GLB refers to must be ordinary files: no extra hard links and no sparse
   files, and together no more than 1 GiB. Embedded data inside a GLB doesn't count toward that
   limit.
