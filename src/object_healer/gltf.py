@@ -7,9 +7,15 @@ bytes into the healed output. So before Blender sees anything:
 - every buffers[].uri and images[].uri must be a base64 data: URI or a relative path that stays
   inside the model's own folder, judged with Blender's own rules (below), both on the path as
   written and after symlinks are followed;
-- the model and each file it references are copied into a private folder, every referenced file
-  read through a descriptor that is checked to still be the in-folder file, and Blender is given
-  only the copy, so nothing can be swapped between the check and the import.
+- the model and each file it references are copied into a private folder, and Blender is given
+  only the copy. Each referenced file is read through one descriptor; the kernel is asked where
+  that open file actually is (F_GETPATH), which must be inside the model's folder, and the name
+  must still lead to the same file (device and inode). A file swapped while it is checked, or a
+  folder above it swapped for a symlink, is refused rather than copied.
+- a referenced file must be a regular file with no other hard links (its location could not be
+  confirmed) and not sparse, and the referenced files together may total at most
+  MAX_REFERENCED_BYTES, so a model can't make staging fill the disk. Anything that goes wrong
+  while staging, out of disk space included, is a refusal for that file.
 
 Blender 5.1 (io_scene_gltf2, io/imp/gltf2_io_gltf.py load_uri) decodes a URI as data only when
 it starts with "data:" and contains ";base64,"; anything else, including "data:/../x", is
@@ -24,9 +30,17 @@ import stat
 import struct
 from urllib.parse import unquote, urlsplit
 
+try:
+    import fcntl
+except ImportError:  # not on Windows; there /proc isn't either, so references are refused
+    fcntl = None
+
 GLB_MAGIC = b"glTF"
 GLB_JSON_CHUNK = 0x4E4F534A
 DATA_URI = re.compile(r"data:[^,]*;base64,")
+MAX_REFERENCED_BYTES = 1 << 30  # 1 GiB for all of a model's referenced files together
+SPARSE_MIN_BYTES = 1 << 20  # below this, block rounding makes the allocation test meaningless
+PROC_FD = "/proc/self/fd"
 
 
 class Refused(Exception):
@@ -66,9 +80,9 @@ def _inside(folder, path):
     return os.path.commonpath([folder, path]) == folder
 
 
-def reference(uri, folder):
+def reference(uri, folder, real_folder=None):
     """The path, relative to folder, that Blender would read for uri; None for embedded data.
-    Raises Refused naming the problem."""
+    Raises Refused naming the problem. real_folder is realpath(folder), if already known."""
     if not isinstance(uri, str):
         raise Refused("is not a string")
     if uri == "" or DATA_URI.match(uri):
@@ -83,7 +97,7 @@ def reference(uri, folder):
     if os.path.isabs(rel):
         raise Refused("is an absolute path")
     lexical = os.path.normpath(os.path.join(folder, rel))
-    real_folder = os.path.realpath(folder)
+    real_folder = real_folder or os.path.realpath(folder)
     if not _inside(folder, lexical) or rel in (os.curdir, os.pardir):
         raise Refused("points outside the model's folder")
     if not _inside(real_folder, os.path.realpath(lexical)):
@@ -91,9 +105,43 @@ def reference(uri, folder):
     return rel
 
 
-def _copy_inside(folder, rel, dest):
-    """Copy folder/rel to dest through one descriptor, checked to be a regular file that is still
-    the in-folder file after symlinks are followed."""
+def kernel_path(fd):
+    """Where the kernel says the open file or folder fd is now, symlinks resolved."""
+    if fcntl is not None and hasattr(fcntl, "F_GETPATH"):  # macOS
+        return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+    if os.path.isdir(PROC_FD):  # Linux
+        return os.readlink(os.path.join(PROC_FD, str(fd)))
+    raise Refused("can't be confirmed to be inside the model's folder on this system")
+
+
+def folder_kernel_path(folder):
+    fd = os.open(folder, os.O_RDONLY)
+    try:
+        return kernel_path(fd)
+    finally:
+        os.close(fd)
+
+
+def _is_sparse(st):
+    if st.st_size < SPARSE_MIN_BYTES or getattr(st, "st_flags", 0) & getattr(stat, "UF_COMPRESSED", 0):
+        return False  # tiny, or compressed by the file system (APFS/HFS+), which isn't sparse
+    return st.st_blocks * 512 * 4 < st.st_size
+
+
+def _copy_bounded(f, out, limit):
+    copied = 0
+    while chunk := f.read(1 << 20):
+        copied += len(chunk)
+        if copied > limit:
+            raise Refused("grew past the size limit while it was being copied")
+        out.write(chunk)
+    return copied
+
+
+def _copy_inside(folder, rel, dest, kernel_folder, budget):
+    """Copy folder/rel to dest through one descriptor and return the bytes copied. The open file
+    must be a regular, unshared, non-sparse file within budget, the kernel must place it inside
+    kernel_folder, and the name must still lead to it."""
     path = os.path.join(folder, rel)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -101,27 +149,34 @@ def _copy_inside(folder, rel, dest):
         raise Refused("names a file that does not exist") from None
     except OSError as e:
         raise Refused(f"can't be opened ({e.strerror})") from None
-    opened = os.fstat(fd)
-    if not stat.S_ISREG(opened.st_mode):
-        os.close(fd)
-        raise Refused("is not a regular file")
-    with os.fdopen(fd, "rb") as f:
-        real = os.path.realpath(path)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise Refused("is not a regular file")
+        if opened.st_nlink > 1:
+            raise Refused("has other hard links, so where it really lives can't be confirmed")
+        if opened.st_size > budget:
+            raise Refused(f"would take the model's referenced files past the "
+                          f"{MAX_REFERENCED_BYTES >> 30} GiB limit")
+        if _is_sparse(opened):
+            raise Refused("is a sparse file (mostly holes), refused so staging can't fill the disk")
+        if not _inside(kernel_folder, kernel_path(fd)):
+            raise Refused("is open outside the model's folder (a folder on its path was swapped)")
         try:
-            now = os.stat(real)
+            now = os.stat(os.path.realpath(path))
         except OSError:
             now = None
-        if (not _inside(os.path.realpath(folder), real) or now is None
-                or (now.st_dev, now.st_ino) != (opened.st_dev, opened.st_ino)):
+        if now is None or (now.st_dev, now.st_ino) != (opened.st_dev, opened.st_ino):
             raise Refused("changed or moved outside the model's folder while it was being read")
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         try:
             out = open(dest, "xb")
         except FileExistsError:
-            return  # the same file under another case on a case-insensitive disk
-        with out:
-            while chunk := f.read(1 << 20):
-                out.write(chunk)
+            return 0  # the same file under another case on a case-insensitive disk
+        with out, os.fdopen(os.dup(fd), "rb") as f:
+            return _copy_bounded(f, out, budget)
+    finally:
+        os.close(fd)
 
 
 def stage(src, dest):
@@ -129,8 +184,12 @@ def stage(src, dest):
     relative layout; return the copy of the model. Raises Refused with a reason for the user."""
     glb = src.lower().endswith(".glb")
     folder = os.path.dirname(os.path.abspath(src))
-    with open(src, "rb") as f:
-        data = f.read()
+    try:
+        real_folder = os.path.realpath(folder)
+        with open(src, "rb") as f:
+            data = f.read()
+    except (OSError, ValueError) as e:
+        raise Refused(f"the model could not be read ({e})") from None
     try:
         doc = _json_from(data, glb)
         uris = list(_uris(doc))
@@ -140,7 +199,7 @@ def stage(src, dest):
     refs = {}
     for label, uri in uris:
         try:
-            rel = reference(uri, folder)
+            rel = reference(uri, folder, real_folder)
         except Refused as e:
             raise Refused(f"refused: {label} {uri!r} {e}") from None
         except ValueError as e:  # a path os functions reject outright
@@ -148,17 +207,22 @@ def stage(src, dest):
         if rel is not None:
             refs.setdefault(rel, (label, uri))
 
-    os.makedirs(dest)
     staged = os.path.join(dest, os.path.basename(src))
-    for rel, (label, uri) in refs.items():
-        if os.path.normcase(rel) == os.path.normcase(os.path.basename(src)):
-            continue  # the model naming itself; the copy written below serves
-        try:
-            _copy_inside(folder, rel, os.path.join(dest, rel))
-        except Refused as e:
-            raise Refused(f"refused: {label} {uri!r} {e}") from None
-        except ValueError as e:
-            raise Refused(f"refused: {label} {uri!r} is not a usable path ({e})") from None
-    with open(staged, "wb") as f:
-        f.write(data)  # the exact bytes that were checked
+    budget = MAX_REFERENCED_BYTES
+    try:
+        os.makedirs(dest)
+        kernel_folder = folder_kernel_path(folder) if refs else None
+        for rel, (label, uri) in refs.items():
+            if os.path.normcase(rel) == os.path.normcase(os.path.basename(src)):
+                continue  # the model naming itself; the copy written below serves
+            try:
+                budget -= _copy_inside(folder, rel, os.path.join(dest, rel), kernel_folder, budget)
+            except Refused as e:
+                raise Refused(f"refused: {label} {uri!r} {e}") from None
+            except (OSError, ValueError) as e:
+                raise Refused(f"refused: {label} {uri!r} could not be staged ({e})") from None
+        with open(staged, "wb") as f:
+            f.write(data)  # the exact bytes that were checked
+    except (OSError, ValueError) as e:
+        raise Refused(f"the model could not be staged ({e})") from None
     return staged

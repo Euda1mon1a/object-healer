@@ -179,7 +179,7 @@ def test_swap_to_a_symlink_out_before_the_read_is_caught(model_dir, tmp_path, ra
         os.remove(path)
         os.symlink(tmp_path / "secret.bin", path)
     race(before=to_outside)
-    assert "changed or moved outside" in refused(src, tmp_path)
+    assert "outside the model's folder" in refused(src, tmp_path)
 
 
 def test_swap_out_and_back_around_the_read_is_caught(model_dir, tmp_path, race):
@@ -195,14 +195,14 @@ def test_swap_out_and_back_around_the_read_is_caught(model_dir, tmp_path, race):
         os.remove(path)
         os.replace(saved, path)
     race(before=to_outside, after=back)
-    assert "changed or moved outside" in refused(src, tmp_path)
+    assert "outside the model's folder" in refused(src, tmp_path)
 
 
 def test_swap_to_another_file_after_the_open_is_caught(model_dir, tmp_path, race):
     src = write_gltf(model_dir, buffers=["mesh.bin"])
     (model_dir / "other.bin").write_bytes(b"other")
     race(after=lambda path: os.replace(model_dir / "other.bin", path))
-    assert "changed or moved outside" in refused(src, tmp_path)
+    assert "outside the model's folder" in refused(src, tmp_path)
 
 
 # --- through heal_file and the command ----------------------------------------------------------
@@ -304,7 +304,7 @@ def test_any_valueerror_while_staging_becomes_a_refusal(model_dir, tmp_path, mon
         raise ValueError("embedded null byte")
     monkeypatch.setattr(gltf, "_copy_inside", bad_path)
     msg = refused(write_gltf(model_dir, buffers=["mesh.bin"]), tmp_path)
-    assert "is not a usable path (embedded null byte)" in msg
+    assert "could not be staged (embedded null byte)" in msg
 
 
 def test_a_batch_keeps_going_past_a_bad_file(model_dir, tmp_path, monkeypatch, capsys):
@@ -325,3 +325,149 @@ def test_a_batch_keeps_going_past_a_bad_file(model_dir, tmp_path, monkeypatch, c
     out, err = capsys.readouterr()
     assert good == ["a.stl", "c.stl"]
     assert "NUL character" in err and "unexpected error: RuntimeError" in err
+
+
+# --- 0.1.1: where the open file really is, and what staging may cost --------------------------
+
+def test_parent_folder_swapped_around_the_open_is_caught(tmp_path, monkeypatch):
+    # The reviewer's interleaving: sub/ is a symlink to outside/ when the file is opened, a real
+    # folder again when its name is resolved, and a symlink once more when that name is stat'ed,
+    # so the name check and the device/inode check both pass on the outside file. Only asking
+    # the kernel where the open file is catches it.
+    model, outside = tmp_path / "model", tmp_path / "outside"
+    (model / "sub").mkdir(parents=True)
+    outside.mkdir()
+    (model / "sub" / "mesh.bin").write_bytes(b"INFOLDER")
+    (outside / "mesh.bin").write_bytes(b"CANARY-OUTSIDE-BYTES")
+    src = write_gltf(model, buffers=["sub/mesh.bin"], name="m.gltf")
+    sub, sub_real = model / "sub", model / "sub_real"
+
+    def to_link():
+        os.rename(sub, sub_real)
+        os.symlink(outside, sub)
+
+    def to_real():
+        os.remove(sub)
+        os.rename(sub_real, sub)
+
+    real_open, real_stat = os.open, os.stat
+
+    def racing_open(path, flags, *a, **kw):
+        hit = str(path).endswith("mesh.bin")
+        if hit:
+            to_link()
+        fd = real_open(path, flags, *a, **kw)
+        if hit:
+            to_real()
+        return fd
+
+    def racing_stat(path, *a, **kw):
+        if str(path).endswith("mesh.bin") and not os.path.islink(sub):
+            to_link()
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(gltf.os, "open", racing_open)
+    monkeypatch.setattr(gltf.os, "stat", racing_stat)
+    with pytest.raises(gltf.Refused, match="open outside the model's folder"):
+        gltf.stage(str(src), str(tmp_path / "dest"))
+    assert not (tmp_path / "dest" / "sub" / "mesh.bin").exists()
+
+
+def test_kernel_path_matches_the_opened_file(model_dir):
+    fd = os.open(model_dir / "mesh.bin", os.O_RDONLY)
+    try:
+        assert gltf.kernel_path(fd) == os.path.join(gltf.folder_kernel_path(str(model_dir)), "mesh.bin")
+    finally:
+        os.close(fd)
+
+
+def test_folder_typed_in_another_case_still_stages(tmp_path):
+    (tmp_path / "Model").mkdir()
+    (tmp_path / "Model" / "mesh.bin").write_bytes(b"\0" * 4)
+    write_gltf(tmp_path / "Model", buffers=["mesh.bin"])
+    typed = tmp_path / "model" / "model.gltf"
+    if not typed.exists():
+        pytest.skip("case-sensitive file system")
+    assert os.path.isfile(gltf.stage(str(typed), str(tmp_path / "staged")))
+
+
+def test_no_way_to_ask_the_kernel_refuses_references_but_not_plain_models(model_dir, tmp_path,
+                                                                          monkeypatch):
+    monkeypatch.setattr(gltf, "fcntl", None)
+    monkeypatch.setattr(gltf, "PROC_FD", str(tmp_path / "no-proc"))
+    assert "can't be confirmed" in refused(write_gltf(model_dir, buffers=["mesh.bin"]), tmp_path)
+    plain = write_glb(model_dir, {"asset": {"version": "2.0"}, "buffers": [{"byteLength": 4}]})
+    assert os.path.isfile(gltf.stage(str(plain), str(tmp_path / "plain")))
+
+
+def test_hard_links_are_refused(model_dir, tmp_path):
+    os.link(model_dir / "mesh.bin", model_dir / "twin.bin")
+    assert "hard links" in refused(write_gltf(model_dir, buffers=["mesh.bin"]), tmp_path)
+
+
+def test_size_cap_per_file_and_in_total(model_dir, tmp_path, monkeypatch):
+    monkeypatch.setattr(gltf, "MAX_REFERENCED_BYTES", 10)
+    (model_dir / "big.bin").write_bytes(b"x" * 11)
+    assert "limit" in refused(write_gltf(model_dir, buffers=["big.bin"], name="a.gltf"), tmp_path)
+    (model_dir / "six1.bin").write_bytes(b"x" * 6)
+    (model_dir / "six2.bin").write_bytes(b"x" * 6)
+    msg = refused(write_gltf(model_dir, buffers=["six1.bin", "six2.bin"], name="b.gltf"), tmp_path / "b")
+    assert msg.startswith("refused: buffers[1].uri") and "limit" in msg
+    ok = write_gltf(model_dir, buffers=["six1.bin", "mesh.bin"], name="c.gltf")
+    assert os.path.isfile(gltf.stage(str(ok), str(tmp_path / "c")))
+
+
+def test_the_real_cap_is_one_gib():
+    assert gltf.MAX_REFERENCED_BYTES == 1 << 30
+
+
+def test_a_file_growing_during_the_copy_stops_at_the_limit():
+    import io
+    with pytest.raises(gltf.Refused, match="grew past"):
+        gltf._copy_bounded(io.BytesIO(b"x" * 20), io.BytesIO(), 10)
+
+
+def test_sparse_files_are_refused(model_dir, tmp_path):
+    hole = model_dir / "hole.bin"
+    fd = os.open(hole, os.O_RDWR | os.O_CREAT)  # one byte at 64 MiB; APFS keeps a gap that big a hole
+    os.pwrite(fd, b"x", 64 << 20)
+    os.close(fd)
+    st = os.stat(hole)
+    if st.st_blocks * 512 * 4 >= st.st_size:
+        pytest.skip("this file system doesn't store sparse files")
+    assert "sparse" in refused(write_gltf(model_dir, buffers=["hole.bin"]), tmp_path)
+    dense = model_dir / "dense.bin"
+    dense.write_bytes(os.urandom(2 << 20))
+    assert os.path.isfile(gltf.stage(str(write_gltf(model_dir, buffers=["dense.bin"], name="d.gltf")),
+                                     str(tmp_path / "d")))
+
+
+def test_out_of_space_while_copying_is_a_refusal(model_dir, tmp_path, monkeypatch):
+    import errno
+
+    def full(*a):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(gltf, "_copy_bounded", full)
+    msg = refused(write_gltf(model_dir, buffers=["mesh.bin"]), tmp_path)
+    assert "could not be staged" in msg and "No space left" in msg
+
+
+def test_unwritable_staging_folder_is_a_refusal(model_dir, tmp_path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        with pytest.raises(gltf.Refused, match="could not be staged"):
+            gltf.stage(str(write_gltf(model_dir, buffers=["mesh.bin"])), str(locked / "dest"))
+    finally:
+        locked.chmod(0o700)
+
+
+def test_unreadable_model_is_a_refusal(model_dir, tmp_path):
+    src = write_gltf(model_dir, buffers=["mesh.bin"])
+    src.chmod(0o000)
+    try:
+        with pytest.raises(gltf.Refused, match="could not be read"):
+            gltf.stage(str(src), str(tmp_path / "dest"))
+    finally:
+        src.chmod(0o600)
