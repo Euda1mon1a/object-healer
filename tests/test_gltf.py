@@ -128,16 +128,21 @@ def test_glb_json_chunk_is_checked(model_dir, tmp_path):
 
 def test_stage_copies_the_model_and_only_its_references(model_dir, tmp_path):
     (model_dir / "unrelated.txt").write_text("not referenced")
-    os.symlink(model_dir / "mesh.bin", model_dir / "alias.bin")  # in-folder symlink: allowed
-    src = write_gltf(model_dir, buffers=["mesh.bin", "alias.bin", "data:;base64,AAAA"],
-                     images=["tex\\skin.png"])
+    src = write_gltf(model_dir, buffers=["mesh.bin", "data:;base64,AAAA"], images=["tex\\skin.png"])
     staged = gltf.stage(str(src), str(tmp_path / "staged"))
     assert staged == str(tmp_path / "staged" / "model.gltf")
     files = sorted(str(p.relative_to(tmp_path / "staged")) for p in (tmp_path / "staged").rglob("*")
                    if p.is_file())
-    assert files == ["alias.bin", "mesh.bin", "model.gltf", "tex/skin.png"]
-    assert not any(p.is_symlink() for p in (tmp_path / "staged").rglob("*"))
+    assert files == ["mesh.bin", "model.gltf", "tex/skin.png"]
     assert (tmp_path / "staged" / "model.gltf").read_bytes() == src.read_bytes()
+
+
+@pytest.mark.parametrize("link,target", [("alias.bin", "mesh.bin"), ("alias", "tex")])
+def test_symlinks_inside_the_folder_are_refused_too(model_dir, tmp_path, link, target):
+    # Nothing is opened through a symlink, so even a harmless in-folder one is refused.
+    os.symlink(model_dir / target, model_dir / link)
+    uri = link if link.endswith(".bin") else link + "/skin.png"
+    assert "symlink" in refused(write_gltf(model_dir, buffers=[uri]), tmp_path)
 
 
 def test_missing_reference_is_refused(model_dir, tmp_path):
@@ -155,54 +160,47 @@ def test_folder_reference_is_refused(model_dir, tmp_path):
 
 @pytest.fixture
 def race(monkeypatch):
-    """Run before() just ahead of object-healer's open of mesh.bin and after() just behind it:
-    the window an attacker has between the containment check and the read."""
-    def install(before=None, after=None):
+    """Run before() just ahead of object-healer's open of the name `at` and after() just behind
+    it: the window an attacker has between the containment check and the read."""
+    def install(at="mesh.bin", before=None, after=None):
         real_open = os.open
 
         def racing_open(path, flags, *a, **kw):
-            hit = str(path).endswith("mesh.bin")
+            hit = os.path.basename(str(path)) == at
             if hit and before:
-                before(path)
+                before()
             fd = real_open(path, flags, *a, **kw)
             if hit and after:
-                after(path)
+                after()
             return fd
         monkeypatch.setattr(gltf.os, "open", racing_open)
     return install
 
 
-def test_swap_to_a_symlink_out_before_the_read_is_caught(model_dir, tmp_path, race):
+def staged_or_refused(src, tmp_path, rel="mesh.bin"):
+    """The bytes staged for rel, or None if staging refused."""
+    try:
+        gltf.stage(str(src), str(tmp_path / "staged"))
+    except gltf.Refused:
+        return None
+    return (tmp_path / "staged" / rel).read_bytes()
+
+
+def test_swap_to_a_symlink_out_before_the_read_is_refused(model_dir, tmp_path, race):
     src = write_gltf(model_dir, buffers=["mesh.bin"])
 
-    def to_outside(path):
-        os.remove(path)
-        os.symlink(tmp_path / "secret.bin", path)
+    def to_outside():
+        os.remove(model_dir / "mesh.bin")
+        os.symlink(tmp_path / "secret.bin", model_dir / "mesh.bin")
     race(before=to_outside)
-    assert "outside the model's folder" in refused(src, tmp_path)
+    assert "symlink" in refused(src, tmp_path)
 
 
-def test_swap_out_and_back_around_the_read_is_caught(model_dir, tmp_path, race):
-    # the descriptor holds the outside file even though the name looks innocent again
-    src = write_gltf(model_dir, buffers=["mesh.bin"])
-    saved = tmp_path / "saved.bin"
-
-    def to_outside(path):
-        os.replace(path, saved)
-        os.symlink(tmp_path / "secret.bin", path)
-
-    def back(path):
-        os.remove(path)
-        os.replace(saved, path)
-    race(before=to_outside, after=back)
-    assert "outside the model's folder" in refused(src, tmp_path)
-
-
-def test_swap_to_another_file_after_the_open_is_caught(model_dir, tmp_path, race):
+def test_swap_after_the_open_copies_what_was_opened(model_dir, tmp_path, race):
     src = write_gltf(model_dir, buffers=["mesh.bin"])
     (model_dir / "other.bin").write_bytes(b"other")
-    race(after=lambda path: os.replace(model_dir / "other.bin", path))
-    assert "outside the model's folder" in refused(src, tmp_path)
+    race(after=lambda: os.replace(model_dir / "other.bin", model_dir / "mesh.bin"))
+    assert staged_or_refused(src, tmp_path) == b"\0" * 4
 
 
 # --- through heal_file and the command ----------------------------------------------------------
@@ -329,16 +327,22 @@ def test_a_batch_keeps_going_past_a_bad_file(model_dir, tmp_path, monkeypatch, c
 
 # --- 0.1.1: where the open file really is, and what staging may cost --------------------------
 
-def test_parent_folder_swapped_around_the_open_is_caught(tmp_path, monkeypatch):
-    # The reviewer's interleaving: sub/ is a symlink to outside/ when the file is opened, a real
-    # folder again when its name is resolved, and a symlink once more when that name is stat'ed,
-    # so the name check and the device/inode check both pass on the outside file. Only asking
-    # the kernel where the open file is catches it.
+@pytest.fixture
+def two_folders(tmp_path):
+    """model/ (sub/mesh.bin = INFOLDER) and outside/ (sub/mesh.bin and mesh.bin = CANARY)."""
     model, outside = tmp_path / "model", tmp_path / "outside"
-    (model / "sub").mkdir(parents=True)
-    outside.mkdir()
+    for d in (model / "sub", outside / "sub"):
+        d.mkdir(parents=True)
     (model / "sub" / "mesh.bin").write_bytes(b"INFOLDER")
-    (outside / "mesh.bin").write_bytes(b"CANARY-OUTSIDE-BYTES")
+    (outside / "sub" / "mesh.bin").write_bytes(b"CANARY")
+    (outside / "mesh.bin").write_bytes(b"CANARY")
+    return model, outside
+
+
+def test_sub_folder_swapped_around_the_file_open_stays_inside(tmp_path, two_folders, race):
+    # The reviewer's interleaving: sub/ becomes a symlink to outside/ for the file's open and a
+    # real folder again after it. sub/ is already open by then, so only in-folder bytes come.
+    model, outside = two_folders
     src = write_gltf(model, buffers=["sub/mesh.bin"], name="m.gltf")
     sub, sub_real = model / "sub", model / "sub_real"
 
@@ -349,36 +353,72 @@ def test_parent_folder_swapped_around_the_open_is_caught(tmp_path, monkeypatch):
     def to_real():
         os.remove(sub)
         os.rename(sub_real, sub)
+    race(at="mesh.bin", before=to_link, after=to_real)
+    assert staged_or_refused(src, tmp_path, "sub/mesh.bin") == b"INFOLDER"
 
-    real_open, real_stat = os.open, os.stat
 
-    def racing_open(path, flags, *a, **kw):
-        hit = str(path).endswith("mesh.bin")
-        if hit:
-            to_link()
-        fd = real_open(path, flags, *a, **kw)
-        if hit:
-            to_real()
-        return fd
+def test_sub_folder_swapped_before_its_open_is_refused(tmp_path, two_folders, race):
+    model, outside = two_folders
+    src = write_gltf(model, buffers=["sub/mesh.bin"], name="m.gltf")
 
-    def racing_stat(path, *a, **kw):
-        if str(path).endswith("mesh.bin") and not os.path.islink(sub):
-            to_link()
-        return real_stat(path, *a, **kw)
+    def to_link():
+        os.rename(model / "sub", model / "sub_real")
+        os.symlink(outside / "sub", model / "sub")
+    race(at="sub", before=to_link)
+    assert "symlink" in refused(src, tmp_path)
 
-    monkeypatch.setattr(gltf.os, "open", racing_open)
-    monkeypatch.setattr(gltf.os, "stat", racing_stat)
-    with pytest.raises(gltf.Refused, match="open outside the model's folder"):
-        gltf.stage(str(src), str(tmp_path / "dest"))
-    assert not (tmp_path / "dest" / "sub" / "mesh.bin").exists()
+
+@pytest.mark.parametrize("swap_after_check,expect", [
+    (False, None),  # swapped before the name check: the check sees outside/ and refuses
+    (True, b"INFOLDER"),  # swapped after it: only the open folder keeps the reads inside
+])
+def test_model_folder_renamed_between_the_model_read_and_the_references(
+        tmp_path, two_folders, monkeypatch, swap_after_check, expect):
+    # After the model is read, model/ moves away and its name becomes a symlink to outside/,
+    # which has the same layout. Opening references by the folder's name would read CANARY.
+    model, outside = two_folders
+    src = write_gltf(model, buffers=["sub/mesh.bin"], name="m.gltf")
+    real_reference = gltf.reference
+
+    def swap_folder():
+        os.rename(model, tmp_path / "model_away")
+        os.symlink(outside, model)
+
+    def racing_reference(*a, **kw):
+        if not swap_after_check:
+            swap_folder()
+        rel = real_reference(*a, **kw)
+        if swap_after_check:
+            swap_folder()
+        return rel
+    monkeypatch.setattr(gltf, "reference", racing_reference)
+    assert staged_or_refused(src, tmp_path, "sub/mesh.bin") == expect
+
+
+def test_parent_folder_swapped_before_the_folder_open_is_refused(tmp_path, race):
+    # a/model is opened through a, which is switched to a symlink to elsewhere just before
+    for d in ("a/model", "elsewhere/model"):
+        (tmp_path / d).mkdir(parents=True)
+    (tmp_path / "a/model/mesh.bin").write_bytes(b"INFOLDER")
+    (tmp_path / "elsewhere/model/mesh.bin").write_bytes(b"CANARY")
+    src = write_gltf(tmp_path / "a/model", buffers=["mesh.bin"])
+    write_gltf(tmp_path / "elsewhere/model", buffers=["mesh.bin"])
+
+    def swap_parent():
+        os.rename(tmp_path / "a", tmp_path / "a_away")
+        os.symlink(tmp_path / "elsewhere", tmp_path / "a")
+    race(at="model", before=swap_parent)
+    assert "moved while it was being opened" in refused(src, tmp_path)
 
 
 def test_kernel_path_matches_the_opened_file(model_dir):
-    fd = os.open(model_dir / "mesh.bin", os.O_RDONLY)
+    dfd = os.open(model_dir, os.O_RDONLY)
+    fd = os.open("mesh.bin", os.O_RDONLY, dir_fd=dfd)
     try:
-        assert gltf.kernel_path(fd) == os.path.join(gltf.folder_kernel_path(str(model_dir)), "mesh.bin")
+        assert gltf.kernel_path(fd) == os.path.join(gltf.kernel_path(dfd), "mesh.bin")
     finally:
         os.close(fd)
+        os.close(dfd)
 
 
 def test_folder_typed_in_another_case_still_stages(tmp_path):
@@ -391,13 +431,12 @@ def test_folder_typed_in_another_case_still_stages(tmp_path):
     assert os.path.isfile(gltf.stage(str(typed), str(tmp_path / "staged")))
 
 
-def test_no_way_to_ask_the_kernel_refuses_references_but_not_plain_models(model_dir, tmp_path,
-                                                                          monkeypatch):
+def test_no_way_to_ask_the_kernel_refuses_gltf(model_dir, tmp_path, monkeypatch):
     monkeypatch.setattr(gltf, "fcntl", None)
     monkeypatch.setattr(gltf, "PROC_FD", str(tmp_path / "no-proc"))
     assert "can't be confirmed" in refused(write_gltf(model_dir, buffers=["mesh.bin"]), tmp_path)
     plain = write_glb(model_dir, {"asset": {"version": "2.0"}, "buffers": [{"byteLength": 4}]})
-    assert os.path.isfile(gltf.stage(str(plain), str(tmp_path / "plain")))
+    assert "can't be confirmed" in refused(plain, tmp_path / "plain")
 
 
 def test_hard_links_are_refused(model_dir, tmp_path):

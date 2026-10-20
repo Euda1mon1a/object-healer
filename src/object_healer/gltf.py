@@ -8,10 +8,10 @@ bytes into the healed output. So before Blender sees anything:
   inside the model's own folder, judged with Blender's own rules (below), both on the path as
   written and after symlinks are followed;
 - the model and each file it references are copied into a private folder, and Blender is given
-  only the copy. Each referenced file is read through one descriptor; the kernel is asked where
-  that open file actually is (F_GETPATH), which must be inside the model's folder, and the name
-  must still lead to the same file (device and inode). A file swapped while it is checked, or a
-  folder above it swapped for a symlink, is refused rather than copied.
+  only the copy. The model's folder is opened once, and the kernel confirms (F_GETPATH) that the
+  descriptor is that folder. The model and every referenced file are then opened relative to
+  that descriptor, one path component at a time, never following a symlink. Renaming or
+  swapping names afterwards can't move the boundary: nothing is looked up from the root again.
 - a referenced file must be a regular file with no other hard links (its location could not be
   confirmed) and not sparse, and the referenced files together may total at most
   MAX_REFERENCED_BYTES, so a model can't make staging fill the disk. Anything that goes wrong
@@ -23,6 +23,7 @@ read as a file at join(dirname(model), uri_to_path(uri)), where uri_to_path turn
 percent-decodes and normpaths (io/com/path.py). The data test here is stricter than Blender's,
 so whatever passes it Blender also decodes as data.
 """
+import errno
 import json
 import os
 import re
@@ -41,6 +42,7 @@ DATA_URI = re.compile(r"data:[^,]*;base64,")
 MAX_REFERENCED_BYTES = 1 << 30  # 1 GiB for all of a model's referenced files together
 SPARSE_MIN_BYTES = 1 << 20  # below this, block rounding makes the allocation test meaningless
 PROC_FD = "/proc/self/fd"
+DIR_FD = os.open in os.supports_dir_fd  # opening relative to a folder descriptor
 
 
 class Refused(Exception):
@@ -111,15 +113,29 @@ def kernel_path(fd):
         return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
     if os.path.isdir(PROC_FD):  # Linux
         return os.readlink(os.path.join(PROC_FD, str(fd)))
-    raise Refused("can't be confirmed to be inside the model's folder on this system")
+    raise Refused("where its folder really is can't be confirmed on this system")
 
 
-def folder_kernel_path(folder):
-    fd = os.open(folder, os.O_RDONLY)
+def _open_below(dfd, rel):
+    """Open rel under the folder descriptor dfd, one component at a time, following no symlink."""
+    parts = rel.split(os.sep)
+    cur = dfd
     try:
-        return kernel_path(fd)
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+            if cur != dfd:
+                os.close(cur)
+            cur = nxt
+        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cur)
+    except FileNotFoundError:
+        raise Refused("names a file that does not exist") from None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Refused("is a symlink or goes through one") from None
+        raise Refused(f"can't be opened ({e.strerror})") from None
     finally:
-        os.close(fd)
+        if cur != dfd:
+            os.close(cur)
 
 
 def _is_sparse(st):
@@ -138,17 +154,10 @@ def _copy_bounded(f, out, limit):
     return copied
 
 
-def _copy_inside(folder, rel, dest, kernel_folder, budget):
-    """Copy folder/rel to dest through one descriptor and return the bytes copied. The open file
-    must be a regular, unshared, non-sparse file within budget, the kernel must place it inside
-    kernel_folder, and the name must still lead to it."""
-    path = os.path.join(folder, rel)
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    except FileNotFoundError:
-        raise Refused("names a file that does not exist") from None
-    except OSError as e:
-        raise Refused(f"can't be opened ({e.strerror})") from None
+def _copy_inside(dfd, rel, dest, budget):
+    """Copy rel under the folder descriptor dfd to dest and return the bytes copied. It must be a
+    regular file with no other hard links, not sparse, and within budget."""
+    fd = _open_below(dfd, rel)
     try:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):
@@ -160,14 +169,6 @@ def _copy_inside(folder, rel, dest, kernel_folder, budget):
                           f"{MAX_REFERENCED_BYTES >> 30} GiB limit")
         if _is_sparse(opened):
             raise Refused("is a sparse file (mostly holes), refused so staging can't fill the disk")
-        if not _inside(kernel_folder, kernel_path(fd)):
-            raise Refused("is open outside the model's folder (a folder on its path was swapped)")
-        try:
-            now = os.stat(os.path.realpath(path))
-        except OSError:
-            now = None
-        if now is None or (now.st_dev, now.st_ino) != (opened.st_dev, opened.st_ino):
-            raise Refused("changed or moved outside the model's folder while it was being read")
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         try:
             out = open(dest, "xb")
@@ -179,50 +180,66 @@ def _copy_inside(folder, rel, dest, kernel_folder, budget):
         os.close(fd)
 
 
+def _read_model(dfd, name):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError as e:
+        raise Refused(f"the model could not be read ({e.strerror})") from None
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise Refused("the model is not a regular file")
+        return f.read()
+
+
 def stage(src, dest):
     """Copy the model at src and every file it references into the new folder dest, keeping the
     relative layout; return the copy of the model. Raises Refused with a reason for the user."""
+    if not DIR_FD:
+        raise Refused("glTF and GLB files need dir_fd support, which this system lacks")
     glb = src.lower().endswith(".glb")
-    folder = os.path.dirname(os.path.abspath(src))
     try:
-        real_folder = os.path.realpath(folder)
-        with open(src, "rb") as f:
-            data = f.read()
+        folder, name = os.path.split(os.path.realpath(src))
+        dfd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except (OSError, ValueError) as e:
-        raise Refused(f"the model could not be read ({e})") from None
+        raise Refused(f"the model's folder could not be opened ({e})") from None
     try:
-        doc = _json_from(data, glb)
-        uris = list(_uris(doc))
-    except (ValueError, UnicodeDecodeError) as e:
-        raise Refused(f"not a readable glTF file ({e})") from None
-
-    refs = {}
-    for label, uri in uris:
+        where = kernel_path(dfd)
+        if where != folder and where.casefold() != folder.casefold():  # case: APFS default
+            raise Refused("the model's folder moved while it was being opened")
+        data = _read_model(dfd, name)
         try:
-            rel = reference(uri, folder, real_folder)
-        except Refused as e:
-            raise Refused(f"refused: {label} {uri!r} {e}") from None
-        except ValueError as e:  # a path os functions reject outright
-            raise Refused(f"refused: {label} {uri!r} is not a usable path ({e})") from None
-        if rel is not None:
-            refs.setdefault(rel, (label, uri))
+            doc = _json_from(data, glb)
+            uris = list(_uris(doc))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise Refused(f"not a readable glTF file ({e})") from None
 
-    staged = os.path.join(dest, os.path.basename(src))
-    budget = MAX_REFERENCED_BYTES
-    try:
+        refs = {}
+        for label, uri in uris:
+            try:
+                rel = reference(uri, folder, folder)
+            except Refused as e:
+                raise Refused(f"refused: {label} {uri!r} {e}") from None
+            except ValueError as e:  # a path os functions reject outright
+                raise Refused(f"refused: {label} {uri!r} is not a usable path ({e})") from None
+            if rel is not None:
+                refs.setdefault(rel, (label, uri))
+
+        staged = os.path.join(dest, os.path.basename(src))
+        budget = MAX_REFERENCED_BYTES
         os.makedirs(dest)
-        kernel_folder = folder_kernel_path(folder) if refs else None
         for rel, (label, uri) in refs.items():
-            if os.path.normcase(rel) == os.path.normcase(os.path.basename(src)):
+            if os.path.normcase(rel) == os.path.normcase(name):
                 continue  # the model naming itself; the copy written below serves
             try:
-                budget -= _copy_inside(folder, rel, os.path.join(dest, rel), kernel_folder, budget)
+                budget -= _copy_inside(dfd, rel, os.path.join(dest, rel), budget)
             except Refused as e:
                 raise Refused(f"refused: {label} {uri!r} {e}") from None
             except (OSError, ValueError) as e:
                 raise Refused(f"refused: {label} {uri!r} could not be staged ({e})") from None
         with open(staged, "wb") as f:
             f.write(data)  # the exact bytes that were checked
+        return staged
     except (OSError, ValueError) as e:
         raise Refused(f"the model could not be staged ({e})") from None
-    return staged
+    finally:
+        os.close(dfd)
