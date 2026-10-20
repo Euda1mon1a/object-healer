@@ -431,6 +431,33 @@ def test_folder_typed_in_another_case_still_stages(tmp_path):
     assert os.path.isfile(gltf.stage(str(typed), str(tmp_path / "staged")))
 
 
+def test_folder_typed_in_another_unicode_form_still_stages(tmp_path):
+    import unicodedata
+    stored = tmp_path / unicodedata.normalize("NFD", "Café")
+    stored.mkdir()
+    (stored / "mesh.bin").write_bytes(b"\0" * 4)
+    write_gltf(stored, buffers=["mesh.bin"])
+    typed = os.path.join(str(tmp_path), unicodedata.normalize("NFC", "Café"), "model.gltf")
+    if not os.path.exists(typed):
+        pytest.skip("normalization-sensitive file system")
+    assert os.path.isfile(gltf.stage(typed, str(tmp_path / "staged")))
+
+
+def test_the_model_itself_is_size_capped_and_not_sparse(model_dir, tmp_path, monkeypatch):
+    big = write_gltf(model_dir, buffers=["mesh.bin"], name="big.gltf")
+    monkeypatch.setattr(gltf, "MAX_MODEL_BYTES", 10)
+    assert "over the" in refused(big, tmp_path / "big")
+    monkeypatch.undo()
+    hole = model_dir / "hole.glb"
+    fd = os.open(hole, os.O_RDWR | os.O_CREAT)  # one byte at 64 MiB; APFS keeps a gap that big a hole
+    os.pwrite(fd, b"x", 64 << 20)
+    os.close(fd)
+    st = os.stat(hole)
+    if st.st_blocks * 512 * 4 >= st.st_size:
+        pytest.skip("this file system doesn't store sparse files")
+    assert "sparse" in refused(hole, tmp_path / "hole")
+
+
 def test_no_way_to_ask_the_kernel_refuses_gltf(model_dir, tmp_path, monkeypatch):
     monkeypatch.setattr(gltf, "fcntl", None)
     monkeypatch.setattr(gltf, "PROC_FD", str(tmp_path / "no-proc"))

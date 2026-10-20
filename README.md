@@ -108,8 +108,8 @@ from the object raises the threshold until it deletes the object too.
   that open folder without following a symlink. Renaming or swapping folders while it runs
   can't redirect a read to somewhere else.
 - Files a glTF or GLB refers to must be ordinary files: no extra hard links and no sparse
-  files, and together no more than 1 GiB. Embedded data inside a GLB doesn't count toward that
-  limit.
+  files, and together no more than 1 GiB. The .gltf or .glb itself may be up to 1 GiB and must
+  not be sparse either.
 
 ## License
 
