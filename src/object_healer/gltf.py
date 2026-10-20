@@ -14,7 +14,8 @@ bytes into the healed output. So before Blender sees anything:
   swapping names afterwards can't move the boundary: nothing is looked up from the root again.
 - a referenced file must be a regular file with no other hard links (its location could not be
   confirmed) and not sparse, and the referenced files together may total at most
-  MAX_REFERENCED_BYTES, so a model can't make staging fill the disk. Anything that goes wrong
+  MAX_REFERENCED_BYTES (the model itself MAX_MODEL_BYTES, also not sparse), so a model can't
+  make staging fill the disk. Anything that goes wrong
   while staging, out of disk space included, is a refusal for that file.
 
 Blender 5.1 (io_scene_gltf2, io/imp/gltf2_io_gltf.py load_uri) decodes a URI as data only when
@@ -29,6 +30,7 @@ import os
 import re
 import stat
 import struct
+import unicodedata
 from urllib.parse import unquote, urlsplit
 
 try:
@@ -40,6 +42,7 @@ GLB_MAGIC = b"glTF"
 GLB_JSON_CHUNK = 0x4E4F534A
 DATA_URI = re.compile(r"data:[^,]*;base64,")
 MAX_REFERENCED_BYTES = 1 << 30  # 1 GiB for all of a model's referenced files together
+MAX_MODEL_BYTES = 1 << 30  # 1 GiB for the .gltf or .glb itself
 SPARSE_MIN_BYTES = 1 << 20  # below this, block rounding makes the allocation test meaningless
 PROC_FD = "/proc/self/fd"
 DIR_FD = os.open in os.supports_dir_fd  # opening relative to a folder descriptor
@@ -180,15 +183,25 @@ def _copy_inside(dfd, rel, dest, budget):
         os.close(fd)
 
 
+def _fold(path):
+    """A path as APFS compares names by default: case-insensitive and normalization-insensitive."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", path).casefold())
+
+
 def _read_model(dfd, name):
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
     except OSError as e:
         raise Refused(f"the model could not be read ({e.strerror})") from None
     with os.fdopen(fd, "rb") as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
             raise Refused("the model is not a regular file")
-        return f.read()
+        if st.st_size > MAX_MODEL_BYTES:
+            raise Refused(f"the model is over the {MAX_MODEL_BYTES >> 30} GiB limit")
+        if _is_sparse(st):
+            raise Refused("the model is a sparse file (mostly holes), refused so staging can't fill the disk")
+        return f.read(MAX_MODEL_BYTES + 1)
 
 
 def stage(src, dest):
@@ -204,7 +217,7 @@ def stage(src, dest):
         raise Refused(f"the model's folder could not be opened ({e})") from None
     try:
         where = kernel_path(dfd)
-        if where != folder and where.casefold() != folder.casefold():  # case: APFS default
+        if where != folder and _fold(where) != _fold(folder):  # APFS ignores case and normalization
             raise Refused("the model's folder moved while it was being opened")
         data = _read_model(dfd, name)
         try:
