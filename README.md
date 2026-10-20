@@ -103,7 +103,11 @@ from the object raises the threshold until it deletes the object too.
 - A glTF or GLB may refer to other files only through base64 `data:` URIs or relative paths
   that stay inside its own folder, with symlinks followed. Absolute paths, `..` escapes and
   `file:` or web URLs are refused. Blender then gets a private copy of the model and of those
-  files only, so a crafted model can't pull anything else into the output.
+  files only. Each file is checked where it actually opened, so one swapped for a link to
+  somewhere else while it is being read is refused rather than copied.
+- Files a glTF or GLB refers to must be ordinary files: no extra hard links and no sparse
+  files, and together no more than 1 GiB. Embedded data inside a GLB doesn't count toward that
+  limit.
 
 ## License
 
