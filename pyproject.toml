@@ -1,0 +1,50 @@
+[project]
+name = "object-healer"
+dynamic = ["version"]
+description = "Repair meshes for 3D printing in headless Blender: merge duplicate vertices, fix normals, fill holes. Drag-and-drop window or command line."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Aaron Montgomery" }]
+keywords = ["mesh repair", "3d printing", "blender", "stl", "watertight", "3d scanning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: MacOS X",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pyqt6>=6.5",
+]
+
+[project.optional-dependencies]
+# --strip-floaters: drop scan debris before the Blender pass
+scan = ["pymeshlab>=2023.12", "numpy>=1.24"]
+
+[project.urls]
+Homepage = "https://github.com/Euda1mon1a/object-healer"
+Issues = "https://github.com/Euda1mon1a/object-healer/issues"
+
+[project.scripts]
+object-healer = "object_healer.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "trimesh>=4", "networkx>=3"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/object_healer/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/object_healer"]
+core-metadata-version = "2.4"
+
+[tool.hatch.build.targets.sdist]
+core-metadata-version = "2.4"
+# docs/icon holds the icon's sources for the README; the app ships only src/object_healer/icons
+exclude = ["/docs"]
